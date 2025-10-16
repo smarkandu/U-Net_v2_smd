@@ -10,7 +10,6 @@ from utils.utils import clip_gradient, adjust_lr, AvgMeter
 import torch.nn.functional as F
 import numpy as np
 import logging
-import wandb
 from unet_v2.UNet_v2 import UNetV2
 
 import matplotlib.pyplot as plt
@@ -20,7 +19,7 @@ def structure_loss(pred, mask):
         pred = F.interpolate(pred, size=mask.shape[-2:],  mode='bilinear', align_corners=False)
 
     weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
-    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduce='none')
+    wbce = F.binary_cross_entropy_with_logits(pred, mask, reduction='none')
     wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
 
     pred = torch.sigmoid(pred)
@@ -61,10 +60,10 @@ def test_1(model, path, dataset):
         gt /= (gt.max() + 1e-8)
         image = image.cuda()
 
-        res, res1  = model(image)
+        res = model(image)
         # eval Dice
-        res = F.upsample(res + res1, size=gt.shape, mode='bilinear', align_corners=False)
-        res = res.sigmoid().data.cpu().numpy().squeeze()
+        res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
+        res = torch.sigmoid(res).detach().data.cpu().numpy().squeeze()
         res = (res - res.min()) / (res.max() - res.min() + 1e-8)
         input = res
         target = np.array(gt)
@@ -98,11 +97,10 @@ def test(model, path, dataset):
         gt /= (gt.max() + 1e-8)
         image = image.cuda()
 
-        res, res1 = model(image)
-        res1 = F.interpolate(res1, res.shape[-2:],  mode='bilinear', align_corners=False)
+        res = model(image)
         # eval Dice
-        res = F.upsample(res + res1, size=gt.shape, mode='bilinear', align_corners=False)
-        res = res.sigmoid().data.cpu().numpy().squeeze()
+        res = F.interpolate(res, size=gt.shape, mode='bilinear', align_corners=False)
+        res = torch.sigmoid(res).detach().data.cpu().numpy().squeeze()
         res = (res - res.min()) / (res.max() - res.min() + 1e-8)
         input = res
         target = np.array(gt)
@@ -132,7 +130,7 @@ def test(model, path, dataset):
 def train(train_loader, model, optimizer, epoch, test_path):
     model.train()
     global best
-    size_rates = [0.75, 1, 1.25] 
+    size_rates = [1] 
     loss_P2_record = AvgMeter()
     for i, pack in enumerate(train_loader, start=1):
         for rate in size_rates:
@@ -144,21 +142,19 @@ def train(train_loader, model, optimizer, epoch, test_path):
             # ---- rescale ----
             trainsize = int(round(opt.trainsize * rate / 32) * 32)
             if rate != 1:
-                images = F.upsample(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
-                gts = F.upsample(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
+                images = F.interpolate(images, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
+                gts = F.interpolate(gts, size=(trainsize, trainsize), mode='bilinear', align_corners=True)
             # ---- forward ----
-            P1, P2= model(images)
+            P = model(images)
             # ---- loss function ----
-            loss_P1 = structure_loss(P1, gts)
-            loss_P2 = structure_loss(P2, gts)
-            loss = loss_P1 + loss_P2 
+            loss = structure_loss(P, gts) 
             # ---- backward ----
             loss.backward()
             clip_gradient(optimizer, opt.clip)
             optimizer.step()
             # ---- recording loss ----
             if rate == 1:
-                loss_P2_record.update(loss_P2.data, opt.batchsize)
+                loss_P2_record.update(loss.detach(), opt.batchsize)
         # ---- train visualization ----
         if i % 20 == 0 or i == total_step:
             print('{} Epoch [{:03d}/{:03d}], Step [{:04d}/{:04d}], '
@@ -182,7 +178,7 @@ def train(train_loader, model, optimizer, epoch, test_path):
     global dict_plot
    
     # test1path = './dataset/TestDataset/'
-    test1path = '/afs/crc.nd.edu/user/y/ypeng4/data/raw_data/polyp/TestDataset'
+    test1path = test_path
 
     dices = []
     ious = []
@@ -192,9 +188,7 @@ def train(train_loader, model, optimizer, epoch, test_path):
         for dataset in ['CVC-300', 'CVC-ClinicDB', 'Kvasir', 'CVC-ColonDB', 'ETIS-LaribPolypDB']:
             dsc, iou, mae = test(model, test1path, dataset)
 
-            wandb.log({f"dsc/{dataset}": dsc}, step=epoch)
-            wandb.log({f"iou/{dataset}": iou}, step=epoch)
-            wandb.log({f"mae/{dataset}": mae}, step=epoch)
+            print(f"[Epoch {epoch}] Dataset: {dataset} | Dice: {dsc:.4f} | IoU: {iou:.4f} | MAE: {mae:.4f}")
 
             dices.append(dsc)
             ious.append(iou)
@@ -205,7 +199,9 @@ def train(train_loader, model, optimizer, epoch, test_path):
         mean_dice = np.mean(dices)
 
         results.append(['mean', np.mean(dices), np.mean(ious), np.mean(maes)])
-        wandb.log({f"mean_dsc": mean_dice}, step=epoch)
+        print(f"[Epoch {epoch}] Mean Dice: {mean_dice:.4f} | "
+      f"Mean IoU: {np.mean(ious):.4f} | "
+      f"Mean MAE: {np.mean(maes):.4f}")
 
         tab = tabulate(results, headers=['dataset', 'dsc', 'iou', 'mae'], floatfmt=".3f")
 
@@ -288,20 +284,12 @@ if __name__ == '__main__':
     # from lib.pvt_3 import PVTNetwork
     # model = PVTNetwork().cuda()
 
-    model = UNetV2(pretrained_path=f"{os.getcwd()}/PolypSeg/pvt_pth/pvt_v2_b2.pth").cuda()
+    model = UNetV2(pretrained_path=f"{os.getcwd()}/PolypSeg/pvt_pth/pvt_v2_b2.pth",deep_supervision=False).cuda()
 
     model_name = model.__class__.__name__
     print(model.__class__.__name__.center(50, "="))
 
     opt.train_save = os.path.join(opt.train_save, model_name)
-
-    wandb.login(key="66b58ac7004a123a43487d7a6cf34ebb4571a7ea")
-    wandb.init(project="Polyp_ori_latest",
-               dir="./wandb",
-               name=model.__class__.__name__,
-               resume="allow",  # must resume, otherwise crash
-               # id=id,
-               config={"class_name": str(model.__class__.__name__)})
 
     best = 0
 
@@ -327,4 +315,4 @@ if __name__ == '__main__':
         train(train_loader, model, optimizer, epoch, opt.test_path)
     
     # plot the eval.png in the training stage
-    # plot_train(dict_plot, name)
+    plot_train(dict_plot, name)
